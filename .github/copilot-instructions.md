@@ -22,7 +22,8 @@ This project strictly covers:
 ### Included
 
 - Transport improvements (QUIC)
-- TLS optimization (PSK, session resumption)
+- TLS optimization (session resumption)
+- TLS offloading (reverse proxy)
 - Kernel-level filtering (eBPF/XDP)
 - Broker-level rate limiting
 - System performance evaluation
@@ -44,7 +45,6 @@ This project strictly covers:
 ### Evaluated Components
 
 - TLS handshake latency
-- TLS-PSK authentication
 - TLS session resumption
 - connection scalability
 
@@ -70,7 +70,7 @@ Client
 ↓
 Transport Layer (TCP / QUIC)
 ↓
-TLS Layer (PSK / Session Resumption)
+TLS Layer (Session Resumption)
 ↓
 MQTT Broker (Mochi)
 ↓
@@ -90,12 +90,13 @@ Modules (Rate Limiter / eBPF / Monitoring)
 
 ---
 
-### 2. TLS 1.3 PSK Authentication
+### 2. TLS Offloading via Reverse Proxy
 
-- Replace certificate-based TLS
-- Reduce memory overhead
-- Reduce handshake complexity
-- Suitable for IoT devices
+- Move TLS termination from broker to a reverse proxy (e.g., NGINX/HAProxy)
+- Broker handles only plain MQTT traffic internally
+- Reduces CPU load on broker
+- Improves scalability under high connection load
+- Common in real-world MQTT deployments
 
 ---
 
@@ -159,7 +160,7 @@ mqtt-ng/
 ### Phase 2 — TLS Improvements
 
 - Implement TLS baseline
-- Add PSK authentication
+- Add TLS offloading setup
 - Add session resumption
 - Measure handshake improvements
 
@@ -200,7 +201,7 @@ mqtt-ng/
 ### Enhanced System
 
 - QUIC transport
-- TLS PSK
+- TLS offloading via proxy
 - TLS session resumption
 - eBPF filtering
 - Rate limiting
@@ -242,3 +243,9 @@ To demonstrate that:
 - measurable improvements
 - backward compatibility
 - reproducible experiments
+
+## Implementation Rule (Mandatory)
+
+- Any new improvement must be implemented as an independent, composable module.
+- New modules must remain compatible with existing modules and baseline mode.
+- Every change must include compatibility testing across relevant module combinations (not only isolated single-module tests).
