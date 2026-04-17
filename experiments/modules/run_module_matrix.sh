@@ -4,7 +4,14 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 RESULTS_ROOT="${RESULTS_ROOT:-$ROOT_DIR/results/module_matrix}"
-RESULTS_DIR="${1:-$RESULTS_ROOT}"
+RESULTS_ARG="${1:-}"
+if [[ -z "$RESULTS_ARG" ]]; then
+  RESULTS_DIR="$RESULTS_ROOT"
+elif [[ "$RESULTS_ARG" = /* ]]; then
+  RESULTS_DIR="$RESULTS_ARG"
+else
+  RESULTS_DIR="$ROOT_DIR/$RESULTS_ARG"
+fi
 RAW_DIR="$RESULTS_DIR/raw"
 METADATA_DIR="$RESULTS_DIR/metadata"
 BROKER_DIR="$ROOT_DIR/broker"
@@ -66,7 +73,7 @@ cleanup() {
 trap cleanup EXIT
 
 cat >"$SUMMARY_CSV" <<'EOF'
-scenario,modules,expect_session_resumption,tls_probe_available,tls_second_reused,valid_total,valid_success,valid_failure,valid_avg_ms,valid_p95_ms,reconnect_total,reconnect_success,reconnect_failure,reconnect_avg_ms,reconnect_p95_ms,reconnect_first_avg_ms,reconnect_speedup_x,validation_status,validation_notes,valid_connect_log,reconnect_log,broker_log
+scenario,modules,tls_profile,expect_session_resumption,tls_probe_available,tls_second_reused,valid_total,valid_success,valid_failure,valid_avg_ms,valid_p95_ms,reconnect_total,reconnect_success,reconnect_failure,reconnect_avg_ms,reconnect_p95_ms,reconnect_first_avg_ms,reconnect_speedup_x,validation_status,validation_notes,valid_connect_log,reconnect_log,broker_log
 EOF
 
 extract_summary_value() {
@@ -156,6 +163,7 @@ capture_metadata() {
 start_broker() {
   local modules="$1"
   local broker_log="$2"
+  local tls_profile="$3"
 
   local broker_cmd=(
     go run ./cmd/main.go
@@ -164,6 +172,7 @@ start_broker() {
     --tls-cert-file "$MQTT_TLS_CERT_FILE"
     --tls-key-file "$MQTT_TLS_KEY_FILE"
     --modules "$modules"
+    --tls-profile "$tls_profile"
   )
 
   (
@@ -378,8 +387,10 @@ validate_scenario() {
 run_scenario() {
   local scenario="$1"
   local modules="$2"
-  local expect_session="$3"
-  local scenario_index="$4"
+  local tls_profile="$3"
+  local expect_session="$4"
+  local scenario_index="$5"
+  local modules_csv
 
   local scenario_dir="$RAW_DIR/$scenario"
   local broker_log="$scenario_dir/broker.log"
@@ -393,8 +404,9 @@ run_scenario() {
   local reconnect_total reconnect_success reconnect_failure reconnect_avg reconnect_p95 reconnect_first reconnect_speedup
 
   mkdir -p "$scenario_dir"
+  modules_csv="${modules//,/+}"
   configure_ports "$scenario_index"
-  start_broker "$modules" "$broker_log"
+  start_broker "$modules" "$broker_log" "$tls_profile"
 
   run_connect_probe "$valid_connect_csv" "$valid_connect_log" "$CONNECT_TLS_SESSION_CACHE_SIZE"
   run_reconnect_probe "$reconnect_csv" "$reconnect_log" "$RECONNECT_TLS_SESSION_CACHE_SIZE"
@@ -420,9 +432,10 @@ run_scenario() {
     "$reconnect_speedup")"
   IFS='|' read -r status notes <<<"$validation"
 
-  printf "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n" \
+  printf "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n" \
     "$scenario" \
-    "$modules" \
+    "$modules_csv" \
+    "$tls_profile" \
     "$expect_session" \
     "$tls_probe_available" \
     "$tls_second_reused" \
@@ -472,14 +485,17 @@ RUN_STARTED_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 ensure_tls_certs
 capture_metadata
 
-run_scenario "baseline" "baseline" "false" "0"
-run_scenario "session_only" "tls-session-resumption" "true" "1"
+run_scenario "baseline" "baseline" "BALANCED" "false" "0"
+run_scenario "session_only" "tls-session-resumption" "BALANCED" "true" "1"
+run_scenario "adaptive_low_power" "adaptive-tls-profiles" "LOW_POWER" "false" "2"
+run_scenario "adaptive_high_security" "adaptive-tls-profiles" "HIGH_SECURITY" "false" "3"
+run_scenario "session_adaptive_low_power" "tls-session-resumption,adaptive-tls-profiles" "LOW_POWER" "true" "4"
 
-BASELINE_FIRST_CONNECT_AVG="$(awk -F, '$1=="baseline"{print $16}' "$SUMMARY_CSV")"
-SESSION_ONLY_FIRST_CONNECT_AVG="$(awk -F, '$1=="session_only"{print $16}' "$SUMMARY_CSV")"
+BASELINE_FIRST_CONNECT_AVG="$(awk -F, '$1=="baseline"{print $17}' "$SUMMARY_CSV")"
+SESSION_ONLY_FIRST_CONNECT_AVG="$(awk -F, '$1=="session_only"{print $17}' "$SUMMARY_CSV")"
 FIRST_CONNECT_SESSION_DRIFT_PCT="$(abs_percent_delta "$BASELINE_FIRST_CONNECT_AVG" "$SESSION_ONLY_FIRST_CONNECT_AVG")"
 
-FAILED_COUNT="$(awk -F, 'NR > 1 && $18 != "pass" {count++} END {print count + 0}' "$SUMMARY_CSV")"
+FAILED_COUNT="$(awk -F, 'NR > 1 && $19 != "pass" {count++} END {print count + 0}' "$SUMMARY_CSV")"
 TOTAL_SCENARIOS="$(awk 'END {print NR - 1}' "$SUMMARY_CSV")"
 OVERALL_STATUS="pass"
 MATRIX_NOTES=()

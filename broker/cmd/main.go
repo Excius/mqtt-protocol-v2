@@ -18,11 +18,13 @@ import (
 	mqtt "github.com/mochi-mqtt/server/v2"
 	"github.com/mochi-mqtt/server/v2/hooks/auth"
 	"github.com/mochi-mqtt/server/v2/listeners"
+	tlsprofiles "github.com/mochi-mqtt/server/v2/modules/security"
 )
 
 const (
 	moduleBaseline             = "baseline"
 	moduleTLSSessionResumption = "tls-session-resumption"
+	moduleAdaptiveTLSProfiles  = "adaptive-tls-profiles"
 )
 
 type brokerConfig struct {
@@ -32,24 +34,38 @@ type brokerConfig struct {
 	tlsCertFile          string
 	tlsKeyFile           string
 	tlsSessionResumption bool
+	tlsProfile           string
 	modules              string
 }
 
 type brokerRuntime struct {
 	enabledModules       []string
 	tlsSessionResumption bool
+	adaptiveTLSProfiles  bool
+	tlsProfile           string
 }
 
-type brokerModule func(runtime *brokerRuntime) error
+type brokerModule func(runtime *brokerRuntime, cfg brokerConfig) error
 
 var supportedModules = map[string]struct{}{
 	moduleBaseline:             {},
 	moduleTLSSessionResumption: {},
+	moduleAdaptiveTLSProfiles:  {},
 }
 
 var moduleRegistry = map[string]brokerModule{
-	moduleTLSSessionResumption: func(runtime *brokerRuntime) error {
+	moduleTLSSessionResumption: func(runtime *brokerRuntime, _ brokerConfig) error {
 		runtime.tlsSessionResumption = true
+		return nil
+	},
+	moduleAdaptiveTLSProfiles: func(runtime *brokerRuntime, cfg brokerConfig) error {
+		profile, err := tlsprofiles.NormalizeTLSProfile(cfg.tlsProfile)
+		if err != nil {
+			return err
+		}
+
+		runtime.adaptiveTLSProfiles = true
+		runtime.tlsProfile = profile
 		return nil
 	},
 }
@@ -66,7 +82,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	runtime, err := buildBrokerRuntime(enabledModules)
+	runtime, err := buildBrokerRuntime(enabledModules, cfg)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -77,6 +93,7 @@ func main() {
 	}
 
 	log.Printf("broker modules enabled: %s", moduleListForLog(runtime.enabledModules))
+	log.Printf("Using TLS Profile: %s", runtime.tlsProfile)
 
 	sigs := make(chan os.Signal, 1)
 	done := make(chan bool, 1)
@@ -142,7 +159,8 @@ func parseBrokerConfig() brokerConfig {
 	tlsCertFile := flag.String("tls-cert-file", "", "TLS certificate file")
 	tlsKeyFile := flag.String("tls-key-file", "", "TLS key file")
 	tlsSessionResumption := flag.Bool("tls-session-resumption", true, "enable TLS session resumption tickets (legacy toggle)")
-	modules := flag.String("modules", "", "comma-separated modules: baseline,tls-session-resumption")
+	tlsProfile := flag.String("tls-profile", defaultTLSProfileFromEnv(), "TLS profile (LOW_POWER|BALANCED|HIGH_SECURITY). Can be set by TLS_PROFILE, PROFILE, or MQTT_TLS_PROFILE.")
+	modules := flag.String("modules", "", "comma-separated modules: baseline,tls-session-resumption,adaptive-tls-profiles")
 	flag.Parse()
 
 	return brokerConfig{
@@ -152,6 +170,7 @@ func parseBrokerConfig() brokerConfig {
 		tlsCertFile:          *tlsCertFile,
 		tlsKeyFile:           *tlsKeyFile,
 		tlsSessionResumption: *tlsSessionResumption,
+		tlsProfile:           *tlsProfile,
 		modules:              *modules,
 	}
 }
@@ -160,6 +179,11 @@ func validateBrokerConfig(cfg brokerConfig) error {
 	if (cfg.tlsCertFile == "") != (cfg.tlsKeyFile == "") {
 		return errors.New("both --tls-cert-file and --tls-key-file are required for TLS mode")
 	}
+
+	if _, err := tlsprofiles.NormalizeTLSProfile(cfg.tlsProfile); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -184,7 +208,7 @@ func resolveEnabledModules(cfg brokerConfig) ([]string, error) {
 		}
 
 		if _, ok := supportedModules[name]; !ok {
-			return nil, fmt.Errorf("unknown module %q (supported: baseline, tls-session-resumption)", name)
+			return nil, fmt.Errorf("unknown module %q (supported: baseline, tls-session-resumption, adaptive-tls-profiles)", name)
 		}
 		if _, exists := seen[name]; exists {
 			continue
@@ -211,9 +235,10 @@ func resolveEnabledModules(cfg brokerConfig) ([]string, error) {
 	return enabled, nil
 }
 
-func buildBrokerRuntime(enabledModules []string) (brokerRuntime, error) {
+func buildBrokerRuntime(enabledModules []string, cfg brokerConfig) (brokerRuntime, error) {
 	runtime := brokerRuntime{
 		enabledModules: append([]string(nil), enabledModules...),
+		tlsProfile:     tlsprofiles.ProfileBalanced,
 	}
 
 	for _, moduleName := range enabledModules {
@@ -221,8 +246,18 @@ func buildBrokerRuntime(enabledModules []string) (brokerRuntime, error) {
 		if !ok {
 			return brokerRuntime{}, fmt.Errorf("unsupported module %q", moduleName)
 		}
-		if err := applyModule(&runtime); err != nil {
+		if err := applyModule(&runtime, cfg); err != nil {
 			return brokerRuntime{}, fmt.Errorf("%s: %w", moduleName, err)
+		}
+	}
+
+	if !runtime.adaptiveTLSProfiles {
+		selectedProfile, err := tlsprofiles.NormalizeTLSProfile(cfg.tlsProfile)
+		if err != nil {
+			return brokerRuntime{}, err
+		}
+		if selectedProfile != tlsprofiles.ProfileBalanced {
+			return brokerRuntime{}, errors.New("non-balanced TLS profile requires adaptive-tls-profiles module")
 		}
 	}
 
@@ -239,11 +274,15 @@ func buildTLSConfig(cfg brokerConfig, runtime brokerRuntime) (*tls.Config, error
 		return nil, fmt.Errorf("failed to load TLS certificate/key pair: %w", err)
 	}
 
-	return &tls.Config{
-		MinVersion:             tls.VersionTLS12,
-		SessionTicketsDisabled: !runtime.tlsSessionResumption,
-		Certificates:           []tls.Certificate{cert},
-	}, nil
+	tlsProfile := tlsprofiles.ProfileBalanced
+	if runtime.adaptiveTLSProfiles {
+		tlsProfile = runtime.tlsProfile
+	}
+
+	tlsConfig := tlsprofiles.GetTLSConfig(tlsProfile)
+	tlsConfig.SessionTicketsDisabled = !runtime.tlsSessionResumption
+	tlsConfig.Certificates = []tls.Certificate{cert}
+	return tlsConfig, nil
 }
 
 func configureAuthHook(server *mqtt.Server) error {
@@ -258,4 +297,17 @@ func moduleListForLog(enabledModules []string) string {
 		return moduleBaseline
 	}
 	return strings.Join(enabledModules, ",")
+}
+
+func defaultTLSProfileFromEnv() string {
+	if profile := strings.TrimSpace(os.Getenv("TLS_PROFILE")); profile != "" {
+		return profile
+	}
+	if profile := strings.TrimSpace(os.Getenv("PROFILE")); profile != "" {
+		return profile
+	}
+	if profile := strings.TrimSpace(os.Getenv("MQTT_TLS_PROFILE")); profile != "" {
+		return profile
+	}
+	return tlsprofiles.ProfileBalanced
 }

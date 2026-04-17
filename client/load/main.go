@@ -18,6 +18,7 @@ type runStats struct {
 	connectErrors  uint64
 	publishErrors  uint64
 	totalPublishes uint64
+	reconnects     uint64
 }
 
 func loadTLSConfigFromEnv() (*tls.Config, error) {
@@ -73,25 +74,45 @@ func tlsSessionCacheSizeFromEnv() (int, error) {
 	return size, nil
 }
 
-func worker(id int, brokerURL string, workerPublishes int, delay time.Duration, tlsConfig *tls.Config, stats *runStats, wg *sync.WaitGroup) {
+func worker(id int, brokerURL string, workerPublishes int, delay time.Duration, reconnectEvery int, tlsConfig *tls.Config, stats *runStats, wg *sync.WaitGroup) {
 	defer wg.Done()
 
-	opts := mqtt.NewClientOptions()
-	opts.AddBroker(brokerURL)
-	opts.SetClientID(fmt.Sprintf("client-%d", id))
-	if tlsConfig != nil {
-		opts.SetTLSConfig(tlsConfig)
+	connectClient := func() mqtt.Client {
+		opts := mqtt.NewClientOptions()
+		opts.AddBroker(brokerURL)
+		opts.SetClientID(fmt.Sprintf("client-%d-%d", id, time.Now().UnixNano()))
+		opts.SetCleanSession(true)
+		opts.SetAutoReconnect(false)
+		if tlsConfig != nil {
+			opts.SetTLSConfig(tlsConfig)
+		}
+
+		client := mqtt.NewClient(opts)
+		connectToken := client.Connect()
+		connectToken.Wait()
+		if connectToken.Error() != nil {
+			atomic.AddUint64(&stats.connectErrors, 1)
+			return nil
+		}
+		return client
 	}
 
-	client := mqtt.NewClient(opts)
-	connectToken := client.Connect()
-	connectToken.Wait()
-	if connectToken.Error() != nil {
-		atomic.AddUint64(&stats.connectErrors, 1)
+	client := connectClient()
+	if client == nil {
 		return
 	}
 
 	for i := 0; i < workerPublishes; i++ {
+		// Periodically reconnect to exercise TLS handshake throughout the load
+		if reconnectEvery > 0 && i > 0 && i%reconnectEvery == 0 {
+			client.Disconnect(100)
+			client = connectClient()
+			if client == nil {
+				return
+			}
+			atomic.AddUint64(&stats.reconnects, 1)
+		}
+
 		token := client.Publish("test/topic", 0, false, "load test")
 		token.Wait()
 		if token.Error() != nil {
@@ -112,7 +133,8 @@ func main() {
 	args := os.Args[1:]
 
 	if len(args) < 1 {
-		fmt.Println("Usage: go run main.go <number_of_workers> [messages_per_worker] [delay_ms]")
+		fmt.Println("Usage: load_client <number_of_workers> [messages_per_worker] [delay_ms] [reconnect_every]")
+		fmt.Println("  reconnect_every: reconnect after this many publishes per worker (0 = never)")
 		os.Exit(1)
 	}
 
@@ -140,6 +162,15 @@ func main() {
 		}
 	}
 
+	reconnectEvery := 0
+	if len(args) >= 4 {
+		reconnectEvery, err = strconv.Atoi(args[3])
+		if err != nil || reconnectEvery < 0 {
+			fmt.Printf("Invalid reconnect_every: %s\n", args[3])
+			os.Exit(1)
+		}
+	}
+
 	delay := time.Duration(delayMS) * time.Millisecond
 	brokerURL := os.Getenv("MQTT_BROKER_URL")
 	if brokerURL == "" {
@@ -161,7 +192,7 @@ func main() {
 
 	for i := 0; i < noOfWorkers; i++ {
 		wg.Add(1)
-		go worker(i, brokerURL, workerPublishes, delay, tlsConfig, stats, &wg)
+		go worker(i, brokerURL, workerPublishes, delay, reconnectEvery, tlsConfig, stats, &wg)
 	}
 
 	fmt.Println("Completed launching workers, waiting for them to finish...")
@@ -169,13 +200,15 @@ func main() {
 	wg.Wait()
 
 	duration := time.Since(runStart).Seconds()
-	fmt.Printf("SUMMARY workers=%d messages_per_worker=%d delay_ms=%d total_publishes=%d connect_errors=%d publish_errors=%d duration_seconds=%.3f\n",
+	fmt.Printf("SUMMARY workers=%d messages_per_worker=%d delay_ms=%d reconnect_every=%d total_publishes=%d connect_errors=%d publish_errors=%d reconnects=%d duration_seconds=%.3f\n",
 		noOfWorkers,
 		workerPublishes,
 		delayMS,
+		reconnectEvery,
 		atomic.LoadUint64(&stats.totalPublishes),
 		atomic.LoadUint64(&stats.connectErrors),
 		atomic.LoadUint64(&stats.publishErrors),
+		atomic.LoadUint64(&stats.reconnects),
 		duration,
 	)
 

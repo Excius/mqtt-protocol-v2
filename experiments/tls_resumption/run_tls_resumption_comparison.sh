@@ -4,7 +4,14 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 RESULTS_ROOT="${RESULTS_ROOT:-$ROOT_DIR/results/tls_resumption}"
-RESULTS_DIR="${1:-$RESULTS_ROOT}"
+RESULTS_ARG="${1:-}"
+if [[ -z "$RESULTS_ARG" ]]; then
+  RESULTS_DIR="$RESULTS_ROOT"
+elif [[ "$RESULTS_ARG" = /* ]]; then
+  RESULTS_DIR="$RESULTS_ARG"
+else
+  RESULTS_DIR="$ROOT_DIR/$RESULTS_ARG"
+fi
 RAW_DIR="$RESULTS_DIR/raw"
 PLOTS_DIR="$RESULTS_DIR/plots"
 METADATA_DIR="$RESULTS_DIR/metadata"
