@@ -18,6 +18,7 @@ import (
 	mqtt "github.com/mochi-mqtt/server/v2"
 	"github.com/mochi-mqtt/server/v2/hooks/auth"
 	"github.com/mochi-mqtt/server/v2/listeners"
+	"github.com/mochi-mqtt/server/v2/modules/defense"
 	tlsprofiles "github.com/mochi-mqtt/server/v2/modules/security"
 )
 
@@ -25,6 +26,8 @@ const (
 	moduleBaseline             = "baseline"
 	moduleTLSSessionResumption = "tls-session-resumption"
 	moduleAdaptiveTLSProfiles  = "adaptive-tls-profiles"
+	modulePropertyValidator    = "property-validator"
+	moduleAuthDefense          = "auth-defense"
 )
 
 type brokerConfig struct {
@@ -42,6 +45,8 @@ type brokerRuntime struct {
 	enabledModules       []string
 	tlsSessionResumption bool
 	adaptiveTLSProfiles  bool
+	propertyValidator    bool
+	authDefense          bool
 	tlsProfile           string
 }
 
@@ -51,6 +56,8 @@ var supportedModules = map[string]struct{}{
 	moduleBaseline:             {},
 	moduleTLSSessionResumption: {},
 	moduleAdaptiveTLSProfiles:  {},
+	modulePropertyValidator:    {},
+	moduleAuthDefense:          {},
 }
 
 var moduleRegistry = map[string]brokerModule{
@@ -66,6 +73,14 @@ var moduleRegistry = map[string]brokerModule{
 
 		runtime.adaptiveTLSProfiles = true
 		runtime.tlsProfile = profile
+		return nil
+	},
+	modulePropertyValidator: func(runtime *brokerRuntime, _ brokerConfig) error {
+		runtime.propertyValidator = true
+		return nil
+	},
+	moduleAuthDefense: func(runtime *brokerRuntime, _ brokerConfig) error {
+		runtime.authDefense = true
 		return nil
 	},
 }
@@ -106,6 +121,20 @@ func main() {
 	server := mqtt.New(nil)
 	if err := configureAuthHook(server); err != nil {
 		log.Fatal(err)
+	}
+
+	if runtime.propertyValidator {
+		if err := server.AddHook(new(defense.PropertyValidatorHook), nil); err != nil {
+			log.Fatal(fmt.Errorf("failed to add property-validator hook: %w", err))
+		}
+		log.Println("property-validator module enabled")
+	}
+
+	if runtime.authDefense {
+		if err := server.AddHook(new(defense.AuthDefenseHook), nil); err != nil {
+			log.Fatal(fmt.Errorf("failed to add auth-defense hook: %w", err))
+		}
+		log.Println("auth-defense module enabled")
 	}
 
 	tcp := listeners.NewTCP(listeners.Config{
@@ -160,7 +189,7 @@ func parseBrokerConfig() brokerConfig {
 	tlsKeyFile := flag.String("tls-key-file", "", "TLS key file")
 	tlsSessionResumption := flag.Bool("tls-session-resumption", true, "enable TLS session resumption tickets (legacy toggle)")
 	tlsProfile := flag.String("tls-profile", defaultTLSProfileFromEnv(), "TLS profile (LOW_POWER|BALANCED|HIGH_SECURITY). Can be set by TLS_PROFILE, PROFILE, or MQTT_TLS_PROFILE.")
-	modules := flag.String("modules", "", "comma-separated modules: baseline,tls-session-resumption,adaptive-tls-profiles")
+	modules := flag.String("modules", "", "comma-separated modules: baseline,tls-session-resumption,adaptive-tls-profiles,property-validator,auth-defense")
 	flag.Parse()
 
 	return brokerConfig{
@@ -208,7 +237,7 @@ func resolveEnabledModules(cfg brokerConfig) ([]string, error) {
 		}
 
 		if _, ok := supportedModules[name]; !ok {
-			return nil, fmt.Errorf("unknown module %q (supported: baseline, tls-session-resumption, adaptive-tls-profiles)", name)
+			return nil, fmt.Errorf("unknown module %q (supported: baseline, tls-session-resumption, adaptive-tls-profiles, property-validator, auth-defense)", name)
 		}
 		if _, exists := seen[name]; exists {
 			continue

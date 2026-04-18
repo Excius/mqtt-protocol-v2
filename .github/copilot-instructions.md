@@ -127,6 +127,28 @@ Modules (Rate Limiter / eBPF / Monitoring)
 
 ---
 
+### 6. User-Property Injection Defense
+
+- Broker-side validation for MQTT 5 User Properties
+- Property count limit — restricts the maximum number of user properties per message
+- Key/value size limits — prevents excessively large metadata fields
+- Packet property budget — limits total metadata size in a single message
+- Per-client cumulative quota — prevents repeated property abuse from the same client
+- Allows the broker to reject malicious packets early, protecting memory and CPU resources
+
+---
+
+### 7. AUTH Flood Mitigation
+
+- Broker-side defenses to control MQTT 5 authentication traffic and prevent flooding
+- Connection rate limiting — restricts the number of new connection attempts per client/IP
+- AUTH packet validation — limits or blocks excessive AUTH packets during a session
+- Connection timeout controls — terminates stalled or suspicious authentication attempts
+- Concurrent connection limits — prevents attackers from opening large numbers of parallel sessions
+- Detects and blocks abnormal authentication behavior early, protecting system resources
+
+---
+
 ## Repository Structure
 
 ```
@@ -187,6 +209,24 @@ mqtt-ng/
 - Implement QUIC listener
 - Map MQTT sessions to QUIC streams
 - Compare with TCP performance
+
+---
+
+### Phase 6 — User-Property Injection Defense
+
+- Implement broker-side user property validation
+- Apply count, key/value size, and packet budget limits
+- Apply per-client cumulative quota
+- Evaluate memory and CPU impact under property-abuse load
+
+---
+
+### Phase 7 — AUTH Flood Mitigation
+
+- Implement connection rate limiting per client/IP
+- Add AUTH packet validation and session limits
+- Apply connection timeout and concurrent session controls
+- Evaluate resilience under AUTH flood attack scenarios
 
 ---
 
