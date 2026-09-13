@@ -23,6 +23,7 @@ Supported module names:
 - `adaptive-tls-profiles`
 - `property-validator`
 - `auth-defense`
+- `message-integrity`
 
 ### 1.1 Module parsing and composition rules
 
@@ -204,6 +205,53 @@ Configuration path today:
 - Broker adds this hook with `nil` config in `main.go`.
 - Therefore default thresholds are active unless code is changed to inject config.
 
+## 2.6 `message-integrity`
+
+Implementation: `broker/modules/security/message_integrity.go`.
+
+Hook identity and coverage:
+
+- Hook ID: `message-integrity`
+- Hook points: `OnPublish`
+- Target packet type: MQTT PUBLISH user properties (`pk.Properties.User`)
+
+Purpose:
+
+- Provides end-to-end message integrity enforcement and verification support.
+- Requires incoming messages to include a valid cryptographic signature in the `integrity-signature` user property.
+
+Enforcement checks:
+
+- Ensures the `integrity-signature` user property is present.
+- Optionally (and enabled by default in `main.go`), computes an HMAC-SHA256 signature using the message topic and payload, and compares it against the provided base64-encoded signature.
+
+Configuration path today:
+
+- Broker currently adds this hook with a statically configured secure default in `main.go`.
+- By default, it requires signatures, verifies them, and uses a hardcoded shared secret (`default-broker-secret`).
+
+## 2.7 Additional implemented modules
+
+- `priority-messaging`: Implemented inside `broker/modules/routing`. It introduces strict priority queueing for inbound publish messages with Urgent, High, and Normal queues, plus an aging mechanism.
+- `wildcard-tokens`: Implemented inside `broker/modules/security`. It introduces capability-based access control for wildcard subscriptions. It verifies HMAC-signed capability tokens during the SUBSCRIBE phase.
+- `quic-transport`: Implemented inside `broker/listeners`. It integrates `quic-go` to provide an MQTT-over-QUIC network listener that accepts QUIC connections, mapping QUIC streams to `net.Conn` for native connection migration and low latency.
+- `ebpf-filter`: Implemented inside `broker/modules/defense/ebpf`. It drops volumetric network attacks (like connection floods) directly inside the Linux kernel using an eBPF XDP program, preventing them from consuming userspace broker resources.
+
+(These are enabled in `broker/cmd/main.go` via a `-modules=` flag.)
+
+Purpose:
+
+- Standard MQTT brokers process messages using FIFO (first-in-first-out) scheduling, meaning all messages are treated equally.
+- In many IoT scenarios, some messages (e.g., alarms, emergency events, system failures) require faster delivery than routine telemetry data.
+- Without priority control, critical messages may be delayed behind large volumes of normal traffic.
+- MQTT-NG introduces a priority-aware message scheduling mechanism inside the broker.
+
+Behavior and enforcement:
+
+- Messages may include a priority attribute (`Urgent` / `High` / `Normal`).
+- The broker maintains separate priority queues for incoming messages, and the scheduler processes higher priority queues first.
+- An aging mechanism prevents starvation of lower-priority messages.
+
 ---
 
 ## 3. Broker runtime wiring beyond module flags
@@ -213,8 +261,12 @@ Current startup sequence (important for interpretation):
 - Always adds allow-all auth hook (`auth.AllowHook`) first.
 - Conditionally adds `property-validator` hook.
 - Conditionally adds `auth-defense` hook.
+- Conditionally adds `message-integrity` hook.
+- Conditionally adds `priority-messaging` hook.
+- Conditionally adds `wildcard-tokens` hook.
 - Starts listeners:
   - TCP (TLS optional)
+  - QUIC (TLS required, if quic-transport enabled)
   - WebSocket (plain)
   - HTTP stats/info endpoint
 
@@ -395,12 +447,11 @@ Implemented and runnable now:
 - TLS session ticket/resumption toggle module
 - User-property validation defense module
 - AUTH flood/slow-auth defense module
+- End-to-end message integrity module
+- Priority messaging scheduling module
+- Wildcard capability tokens module
+- QUIC transport listener
+- eBPF kernel filtering module
 - Combined-module experiment runners and plotting pipelines
 
-Not yet represented as active runtime modules in this codebase snapshot:
-
-- QUIC transport runtime path
-- TLS offloading proxy integration module
-- eBPF/XDP kernel filter runtime module
-
-Repository has module namespace directories for security/defense work, but current runtime module set is the five modules listed in Section 1.
+Repository has module namespace directories for security/defense work, but current runtime module set is the modules listed in Section 1.

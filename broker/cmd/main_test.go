@@ -1,10 +1,59 @@
 package main
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"math/big"
+	"os"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
+
+// writeTestCert generates a throwaway self-signed cert/key pair on disk for
+// exercising buildTLSConfig without needing real certificates.
+func writeTestCert(t *testing.T) (certFile, keyFile string) {
+	t.Helper()
+
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+
+	template := x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "localhost"},
+		NotBefore:    time.Now(),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+
+	der, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
+	require.NoError(t, err)
+
+	dir := t.TempDir()
+	certFile = filepath.Join(dir, "cert.pem")
+	keyFile = filepath.Join(dir, "key.pem")
+
+	certOut, err := os.Create(certFile)
+	require.NoError(t, err)
+	require.NoError(t, pem.Encode(certOut, &pem.Block{Type: "CERTIFICATE", Bytes: der}))
+	require.NoError(t, certOut.Close())
+
+	keyBytes, err := x509.MarshalECPrivateKey(priv)
+	require.NoError(t, err)
+	keyOut, err := os.Create(keyFile)
+	require.NoError(t, err)
+	require.NoError(t, pem.Encode(keyOut, &pem.Block{Type: "EC PRIVATE KEY", Bytes: keyBytes}))
+	require.NoError(t, keyOut.Close())
+
+	return certFile, keyFile
+}
 
 func TestResolveEnabledModulesLegacyFlags(t *testing.T) {
 	modules, err := resolveEnabledModules(brokerConfig{
@@ -113,4 +162,36 @@ func TestDefaultTLSProfileFromEnv(t *testing.T) {
 
 	t.Setenv("TLS_PROFILE", "BALANCED")
 	require.Equal(t, "BALANCED", defaultTLSProfileFromEnv())
+}
+
+func TestBuildTLSConfigNoCertReturnsNil(t *testing.T) {
+	tlsConfig, err := buildTLSConfig(brokerConfig{}, brokerRuntime{})
+	require.NoError(t, err)
+	require.Nil(t, tlsConfig)
+}
+
+// TestBuildTLSConfigSetsALPNForQUIC is a regression test: QUIC mandates a
+// successful ALPN negotiation as part of its TLS 1.3 handshake, and the same
+// *tls.Config returned here is handed to both the TCP and QUIC listeners in
+// main(). Without NextProtos set, every QUIC client fails to connect with
+// "tls: server did not select an ALPN protocol" — confirmed by actually
+// running the quic-transport experiment before this fix.
+func TestBuildTLSConfigSetsALPNForQUIC(t *testing.T) {
+	certFile, keyFile := writeTestCert(t)
+
+	cfg := brokerConfig{
+		tlsCertFile: certFile,
+		tlsKeyFile:  keyFile,
+	}
+
+	for _, runtime := range []brokerRuntime{
+		{tlsProfile: "BALANCED"},
+		{tlsProfile: "HIGH_SECURITY", adaptiveTLSProfiles: true},
+		{tlsProfile: "LOW_POWER", adaptiveTLSProfiles: true},
+	} {
+		tlsConfig, err := buildTLSConfig(cfg, runtime)
+		require.NoError(t, err)
+		require.NotNil(t, tlsConfig)
+		require.Contains(t, tlsConfig.NextProtos, "mqtt")
+	}
 }

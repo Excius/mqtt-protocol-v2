@@ -1,2 +1,19 @@
 results/
 experiments/baseline/certs/
+
+# Compiled binaries (build with `go build`/`go run`, don't commit output)
+/load
+/probe
+/publisher
+/subscriber
+/broker/main
+/experiments/auth_defense/auth_injector
+/experiments/auth_defense/mochi_broker
+
+# Python virtualenv and bytecode cache used by experiment plotting scripts
+.venv/
+__pycache__/
+*.pyc
+
+# Stray local logs
+debug.log

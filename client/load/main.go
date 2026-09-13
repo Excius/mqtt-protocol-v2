@@ -1,9 +1,15 @@
 package main
 
 import (
+	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -11,7 +17,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	mqtt "github.com/eclipse/paho.mqtt.golang"
+	"github.com/eclipse/paho.golang/paho"
+	"github.com/quic-go/quic-go"
 )
 
 type runStats struct {
@@ -19,6 +26,72 @@ type runStats struct {
 	publishErrors  uint64
 	totalPublishes uint64
 	reconnects     uint64
+}
+
+// quicConn is an adapter that wraps a quic.Connection and quic.Stream into a net.Conn.
+type quicConn struct {
+	*quic.Conn
+	*quic.Stream
+}
+
+func (q *quicConn) Read(b []byte) (n int, err error)   { return q.Stream.Read(b) }
+func (q *quicConn) Write(b []byte) (n int, err error)  { return q.Stream.Write(b) }
+func (q *quicConn) Close() error {
+	err := q.Stream.Close()
+	_ = q.Conn.CloseWithError(0, "client disconnect")
+	return err
+}
+func (q *quicConn) LocalAddr() net.Addr                { return q.Conn.LocalAddr() }
+func (q *quicConn) RemoteAddr() net.Addr               { return q.Conn.RemoteAddr() }
+func (q *quicConn) SetDeadline(t time.Time) error      { return q.Stream.SetDeadline(t) }
+func (q *quicConn) SetReadDeadline(t time.Time) error  { return q.Stream.SetReadDeadline(t) }
+func (q *quicConn) SetWriteDeadline(t time.Time) error { return q.Stream.SetWriteDeadline(t) }
+
+func dialBroker(ctx context.Context, brokerURL string, tlsConfig *tls.Config) (net.Conn, error) {
+	u, err := url.Parse(brokerURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid broker url: %w", err)
+	}
+
+	host := u.Host
+	if !strings.Contains(host, ":") {
+		host = host + ":1883"
+	}
+
+	switch u.Scheme {
+	case "quic", "quic+tls":
+		// tlsConfig may be shared across concurrent callers (e.g. multiple
+		// worker goroutines reconnecting), so clone before mutating it.
+		if tlsConfig == nil {
+			tlsConfig = &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"mqtt"}}
+		} else if len(tlsConfig.NextProtos) == 0 {
+			tlsConfig = tlsConfig.Clone()
+			tlsConfig.NextProtos = []string{"mqtt"}
+		}
+
+		qc, err := quic.DialAddr(ctx, host, tlsConfig, nil)
+		if err != nil {
+			return nil, fmt.Errorf("quic dial failed: %w", err)
+		}
+		
+		stream, err := qc.OpenStreamSync(ctx)
+		if err != nil {
+			qc.CloseWithError(0, "")
+			return nil, fmt.Errorf("quic open stream failed: %w", err)
+		}
+		
+		return &quicConn{Conn: qc, Stream: stream}, nil
+
+	case "tls", "ssl", "tcps":
+		if tlsConfig == nil {
+			tlsConfig = &tls.Config{}
+		}
+		return tls.Dial("tcp", host, tlsConfig)
+	
+	default:
+		// tcp
+		return net.Dial("tcp", host)
+	}
 }
 
 func loadTLSConfigFromEnv() (*tls.Config, error) {
@@ -74,48 +147,96 @@ func tlsSessionCacheSizeFromEnv() (int, error) {
 	return size, nil
 }
 
+type ClientWrapper struct {
+	*paho.Client
+	conn net.Conn
+}
+
 func worker(id int, brokerURL string, workerPublishes int, delay time.Duration, reconnectEvery int, tlsConfig *tls.Config, stats *runStats, wg *sync.WaitGroup) {
 	defer wg.Done()
 
-	connectClient := func() mqtt.Client {
-		opts := mqtt.NewClientOptions()
-		opts.AddBroker(brokerURL)
-		opts.SetClientID(fmt.Sprintf("client-%d-%d", id, time.Now().UnixNano()))
-		opts.SetCleanSession(true)
-		opts.SetAutoReconnect(false)
-		if tlsConfig != nil {
-			opts.SetTLSConfig(tlsConfig)
-		}
+	priority := os.Getenv("MQTT_PRIORITY")
+	integritySecret := os.Getenv("MQTT_INTEGRITY_SECRET")
 
-		client := mqtt.NewClient(opts)
-		connectToken := client.Connect()
-		connectToken.Wait()
-		if connectToken.Error() != nil {
+	connectClient := func() *ClientWrapper {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		
+		conn, err := dialBroker(ctx, brokerURL, tlsConfig)
+		if err != nil {
 			atomic.AddUint64(&stats.connectErrors, 1)
 			return nil
 		}
-		return client
+
+		client := paho.NewClient(paho.ClientConfig{
+			Conn: conn,
+		})
+
+		_, err = client.Connect(ctx, &paho.Connect{
+			ClientID:   fmt.Sprintf("load-%d-%d", id, time.Now().UnixNano()),
+			CleanStart: true,
+			KeepAlive:  30,
+		})
+		if err != nil {
+			conn.Close()
+			atomic.AddUint64(&stats.connectErrors, 1)
+			return nil
+		}
+		return &ClientWrapper{Client: client, conn: conn}
 	}
 
-	client := connectClient()
-	if client == nil {
+	wrapper := connectClient()
+	if wrapper == nil {
 		return
 	}
 
+	topic := "test/load"
+
 	for i := 0; i < workerPublishes; i++ {
-		// Periodically reconnect to exercise TLS handshake throughout the load
+		// Periodically reconnect to exercise TLS/QUIC handshake throughout the load
 		if reconnectEvery > 0 && i > 0 && i%reconnectEvery == 0 {
-			client.Disconnect(100)
-			client = connectClient()
-			if client == nil {
+			_ = wrapper.Disconnect(&paho.Disconnect{ReasonCode: 0})
+			wrapper = connectClient()
+			if wrapper == nil {
 				return
 			}
 			atomic.AddUint64(&stats.reconnects, 1)
 		}
 
-		token := client.Publish("test/topic", 0, false, "load test")
-		token.Wait()
-		if token.Error() != nil {
+		payloadBytes := []byte("load test payload")
+		
+		props := &paho.PublishProperties{}
+		if priority != "" {
+			props.User = append(props.User, paho.UserProperty{Key: "priority", Value: priority})
+		}
+		if integritySecret != "" {
+			mac := hmac.New(sha256.New, []byte(integritySecret))
+			mac.Write([]byte(topic))
+			mac.Write(payloadBytes)
+			sig := base64.StdEncoding.EncodeToString(mac.Sum(nil))
+			props.User = append(props.User, paho.UserProperty{Key: "integrity-signature", Value: sig})
+		}
+
+		// A QoS 1 publish blocks until the broker PUBACKs it. Some hook
+		// rejections (packets.ErrRejectPacket, used by defense modules like
+		// property-validator/message-integrity) are silently dropped by the
+		// broker with no ack at all. paho's client already caps this at its
+		// own PacketTimeout (10s default) via context.Background(), but that
+		// means every rejected message burns a full 10 seconds — enough for
+		// hundreds of rejected publishes in one worker to turn into tens of
+		// minutes of wall-clock time. Use a much shorter, explicit timeout
+		// so a rejected/dropped message fails fast as a publish error
+		// instead of stalling the load generator.
+		pubCtx, pubCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_, err := wrapper.Publish(pubCtx, &paho.Publish{
+			Topic:      topic,
+			Payload:    payloadBytes,
+			QoS:        1,
+			Properties: props,
+		})
+		pubCancel()
+
+		if err != nil {
 			atomic.AddUint64(&stats.publishErrors, 1)
 			continue
 		}
@@ -126,7 +247,7 @@ func worker(id int, brokerURL string, workerPublishes int, delay time.Duration, 
 		}
 	}
 
-	client.Disconnect(250)
+	_ = wrapper.Disconnect(&paho.Disconnect{ReasonCode: 0})
 }
 
 func main() {
@@ -178,7 +299,7 @@ func main() {
 	}
 
 	var tlsConfig *tls.Config
-	if strings.HasPrefix(strings.ToLower(brokerURL), "ssl://") || strings.HasPrefix(strings.ToLower(brokerURL), "tls://") {
+	if strings.Contains(brokerURL, "tls") || strings.Contains(brokerURL, "ssl") || strings.Contains(brokerURL, "quic") {
 		tlsConfig, err = loadTLSConfigFromEnv()
 		if err != nil {
 			fmt.Printf("TLS config error: %v\n", err)
@@ -195,7 +316,7 @@ func main() {
 		go worker(i, brokerURL, workerPublishes, delay, reconnectEvery, tlsConfig, stats, &wg)
 	}
 
-	fmt.Println("Completed launching workers, waiting for them to finish...")
+	fmt.Println("Completed launching workers, waiting for them to finish (MQTTv5 mode)...")
 
 	wg.Wait()
 

@@ -19,6 +19,8 @@ import (
 	"github.com/mochi-mqtt/server/v2/hooks/auth"
 	"github.com/mochi-mqtt/server/v2/listeners"
 	"github.com/mochi-mqtt/server/v2/modules/defense"
+	"github.com/mochi-mqtt/server/v2/modules/defense/ebpf"
+	"github.com/mochi-mqtt/server/v2/modules/routing"
 	tlsprofiles "github.com/mochi-mqtt/server/v2/modules/security"
 )
 
@@ -28,6 +30,11 @@ const (
 	moduleAdaptiveTLSProfiles  = "adaptive-tls-profiles"
 	modulePropertyValidator    = "property-validator"
 	moduleAuthDefense          = "auth-defense"
+	moduleMessageIntegrity     = "message-integrity"
+	modulePriorityMessaging    = "priority-messaging"
+	moduleWildcardTokens       = "wildcard-tokens"
+	moduleQUICTransport        = "quic-transport"
+	moduleEBPFFilter           = "ebpf-filter"
 )
 
 type brokerConfig struct {
@@ -39,6 +46,7 @@ type brokerConfig struct {
 	tlsSessionResumption bool
 	tlsProfile           string
 	modules              string
+	quicAddr             string
 }
 
 type brokerRuntime struct {
@@ -47,6 +55,11 @@ type brokerRuntime struct {
 	adaptiveTLSProfiles  bool
 	propertyValidator    bool
 	authDefense          bool
+	messageIntegrity     bool
+	priorityMessaging    bool
+	wildcardTokens       bool
+	quicTransport        bool
+	ebpfFilter           bool
 	tlsProfile           string
 }
 
@@ -58,6 +71,11 @@ var supportedModules = map[string]struct{}{
 	moduleAdaptiveTLSProfiles:  {},
 	modulePropertyValidator:    {},
 	moduleAuthDefense:          {},
+	moduleMessageIntegrity:     {},
+	modulePriorityMessaging:    {},
+	moduleWildcardTokens:       {},
+	moduleQUICTransport:        {},
+	moduleEBPFFilter:           {},
 }
 
 var moduleRegistry = map[string]brokerModule{
@@ -81,6 +99,26 @@ var moduleRegistry = map[string]brokerModule{
 	},
 	moduleAuthDefense: func(runtime *brokerRuntime, _ brokerConfig) error {
 		runtime.authDefense = true
+		return nil
+	},
+	moduleMessageIntegrity: func(runtime *brokerRuntime, _ brokerConfig) error {
+		runtime.messageIntegrity = true
+		return nil
+	},
+	modulePriorityMessaging: func(runtime *brokerRuntime, _ brokerConfig) error {
+		runtime.priorityMessaging = true
+		return nil
+	},
+	moduleWildcardTokens: func(runtime *brokerRuntime, _ brokerConfig) error {
+		runtime.wildcardTokens = true
+		return nil
+	},
+	moduleQUICTransport: func(runtime *brokerRuntime, _ brokerConfig) error {
+		runtime.quicTransport = true
+		return nil
+	},
+	moduleEBPFFilter: func(runtime *brokerRuntime, _ brokerConfig) error {
+		runtime.ebpfFilter = true
 		return nil
 	},
 }
@@ -137,6 +175,50 @@ func main() {
 		log.Println("auth-defense module enabled")
 	}
 
+	if runtime.messageIntegrity {
+		// Secure default configuration for the broker
+		cfg := &tlsprofiles.MessageIntegrityConfig{
+			RequireSignature: true,
+			VerifySignature:  true,
+			SharedSecret:     []byte("default-broker-secret"), // In a real deployment, this would be loaded from env/config
+		}
+		if err := server.AddHook(new(tlsprofiles.MessageIntegrityHook), cfg); err != nil {
+			log.Fatal(fmt.Errorf("failed to add message-integrity hook: %w", err))
+		}
+		log.Println("message-integrity module enabled")
+	}
+
+	if runtime.ebpfFilter {
+		if err := server.AddHook(new(ebpf.EBPFFilterHook), &ebpf.Options{MaxConnectionsPerSecond: 10}); err != nil {
+			log.Fatal(fmt.Errorf("failed to add ebpf-filter hook: %w", err))
+		}
+		log.Println("ebpf-filter module enabled")
+	}
+
+	if runtime.priorityMessaging {
+		if err := server.AddHook(new(routing.PriorityMessagingHook), nil); err != nil {
+			log.Fatal(fmt.Errorf("failed to add priority-messaging hook: %w", err))
+		}
+		log.Println("priority-messaging module enabled")
+	}
+
+	if runtime.wildcardTokens {
+		// Use a simple configuration mapping for demonstration
+		cfg := &tlsprofiles.WildcardTokensConfig{
+			SharedSecret: []byte("wildcard-broker-secret"),
+			Permissions: map[string][]string{
+				"admin": {"#"},
+				"sensor-1": {"sensors/1/+"},
+				"load-*": {"test/load"},
+				"probe-*": {"test/latency"},
+			},
+		}
+		if err := server.AddHook(new(tlsprofiles.WildcardTokenHook), cfg); err != nil {
+			log.Fatal(fmt.Errorf("failed to add wildcard-tokens hook: %w", err))
+		}
+		log.Println("wildcard-tokens module enabled")
+	}
+
 	tcp := listeners.NewTCP(listeners.Config{
 		ID:        "t1",
 		Address:   cfg.tcpAddr,
@@ -145,6 +227,22 @@ func main() {
 	err = server.AddListener(tcp)
 	if err != nil {
 		log.Fatal(err)
+	}
+
+	if runtime.quicTransport {
+		if tlsConfig == nil {
+			log.Fatal("quic-transport requires TLS to be configured (--tls-cert-file and --tls-key-file)")
+		}
+		quicListener := listeners.NewQUIC(listeners.Config{
+			ID:        "q1",
+			Address:   cfg.quicAddr,
+			TLSConfig: tlsConfig,
+		})
+		err = server.AddListener(quicListener)
+		if err != nil {
+			log.Fatal(err)
+		}
+		log.Println("quic-transport module enabled")
 	}
 
 	ws := listeners.NewWebsocket(listeners.Config{
@@ -189,7 +287,8 @@ func parseBrokerConfig() brokerConfig {
 	tlsKeyFile := flag.String("tls-key-file", "", "TLS key file")
 	tlsSessionResumption := flag.Bool("tls-session-resumption", true, "enable TLS session resumption tickets (legacy toggle)")
 	tlsProfile := flag.String("tls-profile", defaultTLSProfileFromEnv(), "TLS profile (LOW_POWER|BALANCED|HIGH_SECURITY). Can be set by TLS_PROFILE, PROFILE, or MQTT_TLS_PROFILE.")
-	modules := flag.String("modules", "", "comma-separated modules: baseline,tls-session-resumption,adaptive-tls-profiles,property-validator,auth-defense")
+	quicAddr := flag.String("quic", ":1883", "network address for QUIC listener")
+	modules := flag.String("modules", "", "comma-separated modules: baseline,tls-session-resumption,adaptive-tls-profiles,property-validator,auth-defense,message-integrity,priority-messaging,wildcard-tokens,quic-transport,ebpf-filter")
 	flag.Parse()
 
 	return brokerConfig{
@@ -201,6 +300,7 @@ func parseBrokerConfig() brokerConfig {
 		tlsSessionResumption: *tlsSessionResumption,
 		tlsProfile:           *tlsProfile,
 		modules:              *modules,
+		quicAddr:             *quicAddr,
 	}
 }
 
@@ -237,7 +337,7 @@ func resolveEnabledModules(cfg brokerConfig) ([]string, error) {
 		}
 
 		if _, ok := supportedModules[name]; !ok {
-			return nil, fmt.Errorf("unknown module %q (supported: baseline, tls-session-resumption, adaptive-tls-profiles, property-validator, auth-defense)", name)
+			return nil, fmt.Errorf("unknown module %q (supported: baseline, tls-session-resumption, adaptive-tls-profiles, property-validator, auth-defense, message-integrity, priority-messaging, wildcard-tokens, quic-transport, ebpf-filter)", name)
 		}
 		if _, exists := seen[name]; exists {
 			continue
@@ -311,6 +411,14 @@ func buildTLSConfig(cfg brokerConfig, runtime brokerRuntime) (*tls.Config, error
 	tlsConfig := tlsprofiles.GetTLSConfig(tlsProfile)
 	tlsConfig.SessionTicketsDisabled = !runtime.tlsSessionResumption
 	tlsConfig.Certificates = []tls.Certificate{cert}
+	// QUIC mandates a successful ALPN negotiation as part of its TLS 1.3
+	// handshake (unlike plain TLS-over-TCP, where ALPN is optional and
+	// simply goes unused by non-ALPN-aware clients). This same *tls.Config
+	// is shared by both the TCP and QUIC listeners below, so set it
+	// unconditionally: without it, every QUIC client fails to connect with
+	// "tls: server did not select an ALPN protocol", regardless of the
+	// active TLS profile.
+	tlsConfig.NextProtos = []string{"mqtt"}
 	return tlsConfig, nil
 }
 

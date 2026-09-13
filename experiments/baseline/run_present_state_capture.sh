@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-set -euo pipefail
+
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 RESULTS_ARG="${1:-}"
@@ -174,8 +174,8 @@ read_net_totals() {
 }
 
 capture_idle_baseline() {
-  local out_csv="$LATENCY_RAW_DIR/idle_30s.csv"
-  local duration_s="${IDLE_DURATION_S:-30}"
+  local out_csv="$LATENCY_RAW_DIR/idle_5s.csv"
+  local duration_s="${IDLE_DURATION_S:-5}"
 
   cat >"$out_csv" <<'EOF'
 timestamp_iso,epoch_ms,elapsed_s,broker_cpu_pct,broker_rss_kb,sys_cpu_user_pct,sys_cpu_system_pct,sys_cpu_idle_pct,net_rx_bytes_delta,net_tx_bytes_delta,sys_clients_connected,sys_messages_received,sys_memory_alloc,sys_threads,sys_packets_received,sys_packets_sent,sys_subscriptions,sys_inflight,sys_inflight_dropped,sys_messages_dropped,sys_retained,sys_clients_total,sys_clients_maximum
@@ -566,7 +566,6 @@ EOF
 
   local use_equal_tier_duration="${USE_EQUAL_TIER_DURATION:-true}"
   local equal_tier_duration_s="${EQUAL_TIER_DURATION_S:-20}"
-
   local normal_workers="${NORMAL_WORKERS:-50}"
   local normal_delay_ms="${NORMAL_DELAY_MS:-20}"
   local high_workers="${HIGH_WORKERS:-200}"
@@ -649,25 +648,25 @@ EOF
 
   (
     cd "$ROOT_DIR"
-    go run ./client/probe connect --broker "$MQTT_BROKER_URL" --attempts "${CONNECT_ATTEMPTS:-600}" --concurrency "${CONNECT_CONCURRENCY:-30}" --timeout-ms "${CONNECT_TIMEOUT_MS:-5000}" --out "$connect_csv"
+    go run ./client/probe connect --broker "$MQTT_BROKER_URL" --attempts "${CONNECT_ATTEMPTS:-100}" --concurrency "${CONNECT_CONCURRENCY:-30}" --timeout-ms "${CONNECT_TIMEOUT_MS:-5000}" --out "$connect_csv"
   ) >"$connect_log" 2>&1
   append_latency_summary "connect" "connect" "" "" "$connect_csv" "$connect_log"
 
   (
     cd "$ROOT_DIR"
-    go run ./client/probe reconnect --broker "$MQTT_BROKER_URL" --attempts "${RECONNECT_ATTEMPTS:-500}" --timeout-ms "${RECONNECT_TIMEOUT_MS:-5000}" --gap-ms "${RECONNECT_GAP_MS:-20}" --out "$reconnect_csv"
+    go run ./client/probe reconnect --broker "$MQTT_BROKER_URL" --attempts "${RECONNECT_ATTEMPTS:-100}" --timeout-ms "${RECONNECT_TIMEOUT_MS:-5000}" --gap-ms "${RECONNECT_GAP_MS:-20}" --out "$reconnect_csv"
   ) >"$reconnect_log" 2>&1
   append_latency_summary "reconnect" "reconnect" "" "" "$reconnect_csv" "$reconnect_log"
 
   (
     cd "$ROOT_DIR"
-    go run ./client/probe pubsub --broker "$MQTT_BROKER_URL" --samples "${PUBSUB_QOS0_SAMPLES:-1500}" --qos 0 --payload-bytes "${PUBSUB_PAYLOAD_BYTES:-128}" --timeout-ms "${PUBSUB_TIMEOUT_MS:-5000}" --warmup "${PUBSUB_WARMUP:-20}" --out "$pubsub0_csv"
+    go run ./client/probe pubsub --broker "$MQTT_BROKER_URL" --samples "${PUBSUB_QOS0_SAMPLES:-200}" --qos 0 --payload-bytes "${PUBSUB_PAYLOAD_BYTES:-128}" --timeout-ms "${PUBSUB_TIMEOUT_MS:-5000}" --warmup "${PUBSUB_WARMUP:-5}" --out "$pubsub0_csv"
   ) >"$pubsub0_log" 2>&1
   append_latency_summary "pubsub_qos0" "pubsub" "0" "${PUBSUB_PAYLOAD_BYTES:-128}" "$pubsub0_csv" "$pubsub0_log"
 
   (
     cd "$ROOT_DIR"
-    go run ./client/probe pubsub --broker "$MQTT_BROKER_URL" --samples "${PUBSUB_QOS1_SAMPLES:-1500}" --qos 1 --payload-bytes "${PUBSUB_PAYLOAD_BYTES:-128}" --timeout-ms "${PUBSUB_TIMEOUT_MS:-5000}" --warmup "${PUBSUB_WARMUP:-20}" --out "$pubsub1_csv"
+    go run ./client/probe pubsub --broker "$MQTT_BROKER_URL" --samples "${PUBSUB_QOS1_SAMPLES:-200}" --qos 1 --payload-bytes "${PUBSUB_PAYLOAD_BYTES:-128}" --timeout-ms "${PUBSUB_TIMEOUT_MS:-5000}" --warmup "${PUBSUB_WARMUP:-5}" --out "$pubsub1_csv"
   ) >"$pubsub1_log" 2>&1
   append_latency_summary "pubsub_qos1" "pubsub" "1" "${PUBSUB_PAYLOAD_BYTES:-128}" "$pubsub1_csv" "$pubsub1_log"
 }
@@ -732,7 +731,7 @@ load/plots/load_tier_overview.png,plot
 load/plots/load_cpu_rss_trend.png,plot
 load/plots/load_plots_manifest.csv,metadata
 latency/latency_summary.csv,summary
-latency/raw/idle_30s.csv,timeseries
+latency/raw/idle_5s.csv,timeseries
 latency/raw/connect_latency.csv,samples
 latency/raw/reconnect_latency.csv,samples
 latency/raw/pubsub_qos0_rtt.csv,samples

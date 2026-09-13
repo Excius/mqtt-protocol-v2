@@ -2,6 +2,7 @@
 
 import argparse
 import csv
+import sys
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -280,7 +281,7 @@ def main():
     reconnect_rows = require_rows(raw_dir / "reconnect_latency.csv", "reconnect latency")
     pubsub0_rows = require_rows(raw_dir / "pubsub_qos0_rtt.csv", "pubsub qos0")
     pubsub1_rows = require_rows(raw_dir / "pubsub_qos1_rtt.csv", "pubsub qos1")
-    idle_rows = require_rows(raw_dir / "idle_30s.csv", "idle baseline")
+    idle_rows = require_rows(raw_dir / "idle_5s.csv", "idle baseline")
 
     series = {
         "connect": extract_metric(connect_rows, "connect_ms"),
@@ -291,7 +292,12 @@ def main():
 
     for name, values in series.items():
         if not values:
-            raise RuntimeError(f"No successful latency samples for {name}")
+            # A module under test can legitimately cause 100% connection
+            # failure (e.g. eBPF/auth-defense banning the load generator's
+            # own IP after a flood) — that is valid data, not a broken run.
+            # Warn loudly instead of aborting, so this case is still visible
+            # in plot_generation.log without failing the whole capture.
+            print(f"WARNING: no successful latency samples for {name} (0% success — check for an active defense/ban)", file=sys.stderr)
 
     save_latency_cdf(series, output_dir / "latency_cdf.png")
     save_latency_hist(series, output_dir / "latency_histograms.png")

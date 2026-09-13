@@ -16,6 +16,10 @@ import (
 	"time"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
+	"github.com/quic-go/quic-go"
+	"context"
+	"net"
+	"net/url"
 )
 
 type sampleResult struct {
@@ -120,7 +124,9 @@ func tlsConfigForBroker(broker string) (*tls.Config, error) {
 
 func isTLSBrokerURL(broker string) bool {
 	lowerBroker := strings.ToLower(broker)
-	return strings.HasPrefix(lowerBroker, "ssl://") || strings.HasPrefix(lowerBroker, "tls://")
+	return strings.HasPrefix(lowerBroker, "ssl://") ||
+		strings.HasPrefix(lowerBroker, "tls://") ||
+		strings.HasPrefix(lowerBroker, "tcps://")
 }
 
 func newClientOptions(broker, clientID string, timeout time.Duration, tlsConfig *tls.Config) *mqtt.ClientOptions {
@@ -135,7 +141,88 @@ func newClientOptions(broker, clientID string, timeout time.Duration, tlsConfig 
 		opts.SetTLSConfig(tlsConfig)
 	}
 
+	opts.SetCustomOpenConnectionFn(func(uri *url.URL, options mqtt.ClientOptions) (net.Conn, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+		
+		brokerStr := uri.String()
+		if uri.Scheme == "" {
+			brokerStr = broker
+		}
+		
+		return dialBroker(ctx, brokerStr, tlsConfig)
+	})
+
 	return opts
+}
+
+// quicConn is an adapter that wraps a quic.Connection and quic.Stream into a net.Conn.
+type quicConn struct {
+	*quic.Conn
+	*quic.Stream
+}
+
+func (q *quicConn) Read(b []byte) (n int, err error)   { return q.Stream.Read(b) }
+func (q *quicConn) Write(b []byte) (n int, err error)  { return q.Stream.Write(b) }
+func (q *quicConn) Close() error {
+	err := q.Stream.Close()
+	_ = q.Conn.CloseWithError(0, "client disconnect")
+	return err
+}
+func (q *quicConn) LocalAddr() net.Addr                { return q.Conn.LocalAddr() }
+func (q *quicConn) RemoteAddr() net.Addr               { return q.Conn.RemoteAddr() }
+func (q *quicConn) SetDeadline(t time.Time) error      { return q.Stream.SetDeadline(t) }
+func (q *quicConn) SetReadDeadline(t time.Time) error  { return q.Stream.SetReadDeadline(t) }
+func (q *quicConn) SetWriteDeadline(t time.Time) error { return q.Stream.SetWriteDeadline(t) }
+
+func dialBroker(ctx context.Context, brokerURL string, tlsConfig *tls.Config) (net.Conn, error) {
+	u, err := url.Parse(brokerURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid broker url: %w", err)
+	}
+
+	host := u.Host
+	if !strings.Contains(host, ":") {
+		host = host + ":1883"
+	}
+
+	switch u.Scheme {
+	case "quic", "quic+tls":
+		// tlsConfig may be shared across concurrent callers (e.g. runConnect's
+		// worker pool), so clone before mutating it.
+		if tlsConfig == nil {
+			tlsConfig = &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"mqtt"}}
+		} else if len(tlsConfig.NextProtos) == 0 {
+			tlsConfig = tlsConfig.Clone()
+			tlsConfig.NextProtos = []string{"mqtt"}
+		}
+
+		qc, err := quic.DialAddr(ctx, host, tlsConfig, nil)
+		if err != nil {
+			return nil, fmt.Errorf("quic dial failed: %w", err)
+		}
+		
+		stream, err := qc.OpenStreamSync(ctx)
+		if err != nil {
+			qc.CloseWithError(0, "")
+			return nil, fmt.Errorf("quic open stream failed: %w", err)
+		}
+		
+		return &quicConn{Conn: qc, Stream: stream}, nil
+	default:
+		d := net.Dialer{}
+		if u.Scheme == "ssl" || u.Scheme == "tls" || u.Scheme == "tcps" {
+			// Always dial with TLS for these schemes, even if the caller
+			// didn't pre-build a tlsConfig (e.g. isTLSBrokerURL missed the
+			// scheme) — matches the load/publisher/subscriber clients,
+			// which never silently fall back to plain TCP here.
+			if tlsConfig == nil {
+				tlsConfig = &tls.Config{}
+			}
+			return tls.DialWithDialer(&d, "tcp", host, tlsConfig)
+		}
+		return d.DialContext(ctx, "tcp", host)
+	}
 }
 
 func connectOnce(broker, clientID string, timeout time.Duration, tlsConfig *tls.Config, postConnectPause time.Duration) (float64, error) {
@@ -369,12 +456,29 @@ func runPubSub(args []string) error {
 	pending := map[string]chan time.Time{}
 	var pendingMu sync.Mutex
 
+	// Written up front (rather than after setup succeeds) so that a setup
+	// failure — e.g. a security module rejecting every connection — still
+	// produces a CSV with at least one row instead of no file at all. Every
+	// downstream plotting/summary tool treats "0% success" as valid data,
+	// but a missing file as a hard error.
+	rows := make([][]string, 0, *samplesCount+1)
+	rows = append(rows, []string{"sample_id", "qos", "payload_bytes", "publish_wait_ms", "rtt_ms", "success", "error"})
+	stats := make([]sampleResult, 0, *samplesCount)
+
+	writeSetupFailure := func(stage string, cause error) error {
+		rows = append(rows, []string{"0", strconv.Itoa(*qos), strconv.Itoa(*payloadBytes), "", "", "false", sanitizeErr(fmt.Sprintf("%s: %v", stage, cause))})
+		if werr := writeCSV(*out, rows); werr != nil {
+			return fmt.Errorf("%s failed: %w (additionally failed to write CSV: %v)", stage, cause, werr)
+		}
+		return fmt.Errorf("%s failed: %w", stage, cause)
+	}
+
 	subOpts := newClientOptions(*broker, subID, timeout, tlsConfig)
 	sub := mqtt.NewClient(subOpts)
 	subConn := sub.Connect()
 	subConn.WaitTimeout(timeout + (500 * time.Millisecond))
 	if subConn.Error() != nil {
-		return fmt.Errorf("subscriber connect failed: %w", subConn.Error())
+		return writeSetupFailure("subscriber connect", subConn.Error())
 	}
 	defer sub.Disconnect(100)
 
@@ -401,7 +505,7 @@ func runPubSub(args []string) error {
 	subTok := sub.Subscribe(topic, byte(*qos), cb)
 	subTok.WaitTimeout(timeout + (500 * time.Millisecond))
 	if subTok.Error() != nil {
-		return fmt.Errorf("subscribe failed: %w", subTok.Error())
+		return writeSetupFailure("subscribe", subTok.Error())
 	}
 	defer sub.Unsubscribe(topic)
 
@@ -410,13 +514,9 @@ func runPubSub(args []string) error {
 	pubConn := pub.Connect()
 	pubConn.WaitTimeout(timeout + (500 * time.Millisecond))
 	if pubConn.Error() != nil {
-		return fmt.Errorf("publisher connect failed: %w", pubConn.Error())
+		return writeSetupFailure("publisher connect", pubConn.Error())
 	}
 	defer pub.Disconnect(100)
-
-	rows := make([][]string, 0, *samplesCount+1)
-	rows = append(rows, []string{"sample_id", "qos", "payload_bytes", "publish_wait_ms", "rtt_ms", "success", "error"})
-	stats := make([]sampleResult, 0, *samplesCount)
 
 	total := *warmup + *samplesCount
 	for i := 1; i <= total; i++ {

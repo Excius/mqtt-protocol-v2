@@ -266,6 +266,7 @@ func (s *Server) AddHook(hook Hook, config any) error {
 	nl := s.Log.With("hook", hook.ID())
 	hook.SetOpts(nl, &HookOptions{
 		Capabilities: s.Options.Capabilities,
+		Server:       s,
 	})
 
 	s.Log.Info("added hook", "hook", hook.ID())
@@ -966,6 +967,15 @@ func (s *Server) processPublish(cl *Client, pk packets.Packet) error {
 	s.hooks.OnPublished(cl, pk)
 
 	return nil
+}
+
+// InjectPublish allows a hook to inject a publish packet into the broker's subscriber routing, bypassing the Ignore flag check.
+func (s *Server) InjectPublish(cl *Client, pk packets.Packet) {
+	pk.Ignore = false
+	s.publishToSubscribers(pk)
+	if cl != nil {
+		s.hooks.OnPublished(cl, pk)
+	}
 }
 
 // retainMessage adds a message to a topic, and if a persistent store is provided,

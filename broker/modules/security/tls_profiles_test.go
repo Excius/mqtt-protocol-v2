@@ -27,7 +27,7 @@ func TestNormalizeTLSProfile(t *testing.T) {
 func TestGetTLSConfig(t *testing.T) {
 	lowPower := GetTLSConfig(ProfileLowPower)
 	require.Equal(t, uint16(tls.VersionTLS12), lowPower.MinVersion)
-	require.Equal(t, uint16(tls.VersionTLS13), lowPower.MaxVersion)
+	require.Equal(t, uint16(tls.VersionTLS12), lowPower.MaxVersion)
 	require.NotEmpty(t, lowPower.CipherSuites)
 	require.Equal(t, []uint16{
 		tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,

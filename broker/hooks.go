@@ -119,6 +119,7 @@ type Hook interface {
 // HookOptions contains values which are inherited from the server on initialisation.
 type HookOptions struct {
 	Capabilities *Capabilities
+	Server       *Server
 }
 
 // Hooks is a slice of Hook interfaces to be called in sequence.
